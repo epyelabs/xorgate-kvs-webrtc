@@ -71,8 +71,8 @@ extern "C" {
 
 #define RTSP_PIPELINE_MAX_CHAR_COUNT 1000
 
-/* To enable IoT credentials checks in the provided samples, specify
-   this through the CMake flag: cmake .. -DIOT_CORE_ENABLE_CREDENTIALS=ON */
+/* Credential mode is selected at runtime (no build flag): if AWS_IOT_CORE_CREDENTIAL_ENDPOINT is set,
+   the app uses IoT cert-based credentials; otherwise it uses static AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY. */
 #define IOT_CORE_CREDENTIAL_ENDPOINT ((PCHAR) "AWS_IOT_CORE_CREDENTIAL_ENDPOINT")
 #define IOT_CORE_CERT                ((PCHAR) "AWS_IOT_CORE_CERT")
 #define IOT_CORE_PRIVATE_KEY         ((PCHAR) "AWS_IOT_CORE_PRIVATE_KEY")

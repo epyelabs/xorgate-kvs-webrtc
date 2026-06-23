@@ -10,6 +10,8 @@ GStreamer sample), so AWS updates never conflict with it.
 
 ## What's different from the stock sample
 
+### Configurable GStreamer pipeline
+
 The GStreamer sender pipeline is configurable at runtime via the `KVS_GST_PIPELINE`
 environment variable, which points at a **file** containing a `gst-launch` pipeline string:
 
@@ -19,6 +21,31 @@ environment variable, which points at a **file** containing a `gst-launch` pipel
 
 The pipeline must end in `appsink ... name=appsink-video`, and any software encoder should keep
 `name=sampleVideoEncoder` so TWCC bitrate adaptation works. See [`pipeline.example`](pipeline.example).
+
+### Runtime credential selection
+
+The stock sample chooses between static AWS keys and AWS IoT Core certificate credentials at **compile
+time** via `-DIOT_CORE_ENABLE_CREDENTIALS`. This app decides at **runtime** instead, so a single binary
+does both:
+
+- If `AWS_IOT_CORE_CREDENTIAL_ENDPOINT` is set, it uses IoT cert-based credentials (and also requires
+  `AWS_IOT_CORE_CERT`, `AWS_IOT_CORE_PRIVATE_KEY`, `AWS_IOT_CORE_ROLE_ALIAS`, `AWS_IOT_CORE_THING_NAME`).
+- Otherwise it uses static credentials (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`).
+
+#### Channel name resolution
+
+The channel name is the first command-line argument in both modes (`./xorgate-kvs-webrtc my-channel-name`).
+In IoT mode there are additional fallbacks. The full precedence is:
+
+```
+AWS_IOT_CORE_CERTIFICATE_ID   (IoT mode only; if set, overrides everything below)
+  > argv[1]                   (the command-line argument)
+    > AWS_IOT_CORE_THING_NAME (IoT mode env fallback when no argument is given)
+      > ScaryTestChannel      (built-in sample default)
+```
+
+So to name the channel explicitly, pass `argv[1]` and leave `AWS_IOT_CORE_CERTIFICATE_ID` unset (it is
+optional, not one of the required IoT vars). Set it only if you want the channel named after the cert ID.
 
 ## Layout
 
@@ -79,19 +106,36 @@ appsink sync=TRUE emit-signals=TRUE name=appsink-video
 
 ## Run
 
-Provide AWS credentials in the environment (or IoT certs, per the SDK docs), then:
+A CA cert path is required in **both** credential modes (TLS to AWS, and the credential provider in IoT
+mode). Set it and the region from the repo root:
+
+```bash
+export AWS_KVS_CACERT_PATH="$PWD/third_party/amazon-kinesis-video-streams-webrtc-sdk-c/certs/cert.pem"
+export AWS_DEFAULT_REGION=us-west-2     # match your channel's region
+```
+
+Then pick a credential mode (see [Runtime credential selection](#runtime-credential-selection)) and run
+from the build dir:
 
 ```bash
 cd build
 
-# In-code default pipeline:
-./xorgate-kvs-webrtc some-channel-id
+# --- Static credentials ---
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+KVS_GST_PIPELINE=../pipeline.example ./xorgate-kvs-webrtc my-channel-name
 
-# File-driven pipeline:
-KVS_GST_PIPELINE=../pipeline.example ./xorgate-kvs-webrtc some-channel-id
+# --- IoT Core credentials (channel name defaults to the thing name when no arg is given) ---
+export AWS_IOT_CORE_CREDENTIAL_ENDPOINT=...
+export AWS_IOT_CORE_CERT=/path/to/certificate.pem
+export AWS_IOT_CORE_PRIVATE_KEY=/path/to/private.key
+export AWS_IOT_CORE_ROLE_ALIAS=...
+export AWS_IOT_CORE_THING_NAME=...
+KVS_GST_PIPELINE=../pipeline.example ./xorgate-kvs-webrtc
 ```
 
-Verify a session by opening the same channel in the AWS console's WebRTC test viewer.
+Without `KVS_GST_PIPELINE`, the in-code default pipeline is used. Verify a session by opening the same
+channel in the AWS console's WebRTC test viewer.
 
 ## Updating the SDK from upstream AWS
 
