@@ -1,0 +1,3 @@
+[submodule "third_party/amazon-kinesis-video-streams-webrtc-sdk-c"]
+	path = third_party/amazon-kinesis-video-streams-webrtc-sdk-c
+	url = https://github.com/awslabs/amazon-kinesis-video-streams-webrtc-sdk-c.git
