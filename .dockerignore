@@ -1,0 +1,7 @@
+# Force a clean in-container build: never ship host build artifacts (esp. macOS
+# CMake caches / prebuilt libs that would break or pollute the Linux image).
+.git/
+build/
+third_party/amazon-kinesis-video-streams-webrtc-sdk-c/build/
+third_party/amazon-kinesis-video-streams-webrtc-sdk-c/open-source/
+**/.DS_Store
