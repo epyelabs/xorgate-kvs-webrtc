@@ -35,6 +35,15 @@ if [ -z "${KVS_CHANNEL_NAME:-}" ]; then
   exit 1
 fi
 
+# The bundled aws-cli v1 defaults `iot-data` to the deprecated non-ATS endpoint
+# (data.iot.<region>.amazonaws.com), whose cert is no longer trusted, so the recorder's
+# "capturing" publish would fail silently. Resolve the account's ATS data endpoint here
+# (a control-plane call, which works) and export it; the recorder passes it to
+# `aws iot-data publish --endpoint-url`. Non-fatal if it can't be resolved.
+IOT_DATA_ENDPOINT="$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --query endpointAddress --output text 2>/dev/null || true)"
+export IOT_DATA_ENDPOINT
+echo "[entrypoint] IoT data endpoint: ${IOT_DATA_ENDPOINT:-<unresolved>}"
+
 echo "[entrypoint] starting recorder for channel ${KVS_CHANNEL_NAME} (region ${AWS_DEFAULT_REGION})"
 # exec so SIGTERM from ECS StopTask reaches the recorder directly (graceful finalize).
 exec /usr/local/bin/xorgate-kvs-recorder "${KVS_CHANNEL_NAME}" video-only
