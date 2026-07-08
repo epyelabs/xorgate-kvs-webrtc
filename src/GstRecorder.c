@@ -20,26 +20,48 @@
 
 static UINT64 presentationTsIncrement = 0;
 static volatile BOOL recorderEos = FALSE;
-static volatile BOOL captureSignaled = FALSE;
 
-// One-shot, fire-and-forget: on the first received video frame, publish a "capturing"
-// event to IoT Core so the backend can stamp the recordings row's capture_started_at
-// (the UI flips "Starting…" -> "REC"). The task needs ~30-60s to cold-start before any
-// frame arrives, so this is the only honest signal that capture has actually begun.
+// Capture heartbeat state (kvs-webrtc-lts Phase 4 / §4.5). Driven off the frame
+// callback (serialized per stream, so no lock needed): frames arriving is the ONLY
+// honest proof the media plane is alive, so we publish only while they do.
+static UINT64 gCaptureFrameCount = 0;   // frames received this recording
+static UINT64 gLastHeartbeatTime = 0;   // GETTIME() of last publish; 0 = none yet
+static UINT64 gHeartbeatIntervalTime = 0; // cadence in 100ns units; 0 until parsed
+
+// Heartbeat cadence from RECORDER_HEARTBEAT_MS (default 12s), parsed once.
+static UINT64 heartbeatIntervalTime(VOID)
+{
+    if (gHeartbeatIntervalTime == 0) {
+        PCHAR pMs = GETENV("RECORDER_HEARTBEAT_MS");
+        UINT64 ms = (pMs != NULL && pMs[0] != '\0') ? (UINT64) strtoull(pMs, NULL, 10) : 0;
+        if (ms == 0) ms = 12000;
+        gHeartbeatIntervalTime = ms * HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+    }
+    return gHeartbeatIntervalTime;
+}
+
+// Fire-and-forget: publish a "capturing" heartbeat to IoT Core. The backend's
+// recording-capture rule stamps capture_started_at on the FIRST message (UI flips
+// "Starting…" -> "REC") and bumps capture_heartbeat_at on EVERY message — the
+// media-plane liveness the §4.5 offline-stop corroboration + the orphan reconciler
+// check against CAPTURE_STALE_MS. Because we only call this while frames actually
+// arrive, a stalled media plane -> heartbeat stops -> backend can tell.
 //
-// Backgrounded with a trailing `&` so it never blocks the media-receive thread, mirroring
-// the `system()` upload idiom in recorder.c. The AWS CLI picks up the task-role creds and
-// region from the env entrypoint.sh exports (same as the s3 upload). A fileb:// payload is
-// raw bytes in both aws-cli v1 and v2, sidestepping v2's --cli-binary-format requirement.
-static VOID signalCaptureStarted(VOID)
+// Backgrounded with a trailing `&` so it never blocks the media-receive thread,
+// mirroring the `system()` upload idiom in recorder.c. The AWS CLI picks up the
+// task-role creds + region from entrypoint.sh's env exports (same as the s3 upload).
+// A fileb:// payload is raw bytes in aws-cli v1/v2, sidestepping v2's
+// --cli-binary-format requirement.
+static VOID publishCaptureHeartbeat(UINT64 frames)
 {
     PCHAR pRecordingId = GETENV("RECORDING_ID");
     PCHAR pEndpoint = GETENV("IOT_DATA_ENDPOINT");
     CHAR endpointArg[256];
-    CHAR cmd[1536];
+    CHAR payload[256];
+    CHAR cmd[2048];
 
     if (pRecordingId == NULL) {
-        DLOGW("[recorder] RECORDING_ID unset; skipping capture-started signal");
+        DLOGW("[recorder] RECORDING_ID unset; skipping capture heartbeat");
         return;
     }
 
@@ -51,19 +73,39 @@ static VOID signalCaptureStarted(VOID)
         SNPRINTF(endpointArg, SIZEOF(endpointArg), "--endpoint-url 'https://%s' ", pEndpoint);
     }
 
-    // Backgrounded subshell so it never blocks the media-receive thread; it echoes the
-    // outcome to stdout (-> CloudWatch) so the one-shot signal is never silent, even at
-    // the default WARN log level. fileb:// keeps the payload raw bytes in aws-cli v1/v2.
+    // JSON with real double-quotes (safe inside the shell single-quoted printf below;
+    // it contains no single-quotes). ts is informational (backend uses server now()).
+    SNPRINTF(payload, SIZEOF(payload),
+             "{\"state\":\"capturing\",\"frames\":%llu,\"ts\":%llu}",
+             (unsigned long long) frames,
+             (unsigned long long) (GETTIME() / HUNDREDS_OF_NANOS_IN_A_MILLISECOND));
+
+    // Backgrounded subshell so it never blocks the media-receive thread; only logs on
+    // failure so a ~12s cadence doesn't spam CloudWatch.
     SNPRINTF(cmd, SIZEOF(cmd),
-             "( printf '%%s' '{\"state\":\"capturing\"}' > /tmp/%s.cap.json; "
+             "( printf '%%s' '%s' > /tmp/%s.cap.json; "
              "if aws iot-data publish --topic 'xorgate/recordings/%s/status' "
              "%s--payload fileb:///tmp/%s.cap.json >/tmp/%s.cap.out 2>&1; "
-             "then echo '[recorder] capture-started signal published'; "
-             "else echo '[recorder] capture-started signal FAILED'; cat /tmp/%s.cap.out; fi ) &",
-             pRecordingId, pRecordingId, endpointArg, pRecordingId, pRecordingId, pRecordingId);
-    DLOGI("[recorder] signaling capture-started for recording %s", pRecordingId);
+             "then :; "
+             "else echo '[recorder] capture heartbeat FAILED'; cat /tmp/%s.cap.out; fi ) &",
+             payload, pRecordingId, pRecordingId, endpointArg, pRecordingId, pRecordingId, pRecordingId);
     if (system(cmd) != 0) {
-        DLOGW("[recorder] capture-started signal dispatch returned non-zero");
+        DLOGW("[recorder] capture heartbeat dispatch returned non-zero");
+    }
+}
+
+// Publish a heartbeat on the first frame (capture-started) and then at most once per
+// heartbeat interval while frames keep flowing. Called from the frame callback.
+static VOID maybeHeartbeat(VOID)
+{
+    UINT64 now = GETTIME();
+    gCaptureFrameCount++;
+    if (gLastHeartbeatTime == 0 || (now - gLastHeartbeatTime) >= heartbeatIntervalTime()) {
+        if (gLastHeartbeatTime == 0) {
+            DLOGI("[recorder] first frame — signaling capture started");
+        }
+        gLastHeartbeatTime = now;
+        publishCaptureHeartbeat(gCaptureFrameCount);
     }
 }
 
@@ -100,12 +142,10 @@ static VOID onGstVideoFrameReady(UINT64 customData, PFrame pFrame)
     }
     gst_buffer_unref(buffer);
 
-    // A frame arrived -> capture has really begun. Signal once (the transceiver
-    // callback is serialized per stream, so the guard needs no lock).
-    if (!captureSignaled) {
-        captureSignaled = TRUE;
-        signalCaptureStarted();
-    }
+    // A frame arrived -> the media plane is alive. Heartbeat on the first frame
+    // (capture-started) and periodically thereafter (the transceiver callback is
+    // serialized per stream, so the counters need no lock).
+    maybeHeartbeat();
 }
 
 // Streaming-session shutdown -> EOS so mp4mux finalizes a playable MP4.
