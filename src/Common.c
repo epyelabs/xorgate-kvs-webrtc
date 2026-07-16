@@ -1480,9 +1480,23 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
             } else if (signalingCallFailed(retStatus)) {
                 printf("[KVS Common] recreating Signaling Client\n");
                 freeSignalingClient(&pSampleConfiguration->signalingClientHandle);
-                createSignalingClientSync(&pSampleConfiguration->clientInfo, &pSampleConfiguration->channelInfo,
-                                          &pSampleConfiguration->signalingClientCallbacks, pSampleConfiguration->pCredentialProvider,
-                                          &pSampleConfiguration->signalingClientHandle);
+                retStatus = createSignalingClientSync(&pSampleConfiguration->clientInfo, &pSampleConfiguration->channelInfo,
+                                                      &pSampleConfiguration->signalingClientCallbacks, pSampleConfiguration->pCredentialProvider,
+                                                      &pSampleConfiguration->signalingClientHandle);
+                if (STATUS_FAILED(retStatus)) {
+                    // The old client is already freed; with no valid handle nothing in this
+                    // process can ever stream again (a fetch on an invalid handle fails with a
+                    // status signalingCallFailed() doesn't match, so this loop would spin
+                    // forever). Exit instead: the device agent supervises us and respawns the
+                    // master, which reconnects once the network is back.
+                    DLOGE("[KVS Common] recreating Signaling Client failed with 0x%08x; exiting so the supervisor can restart us", retStatus);
+                    CHK(FALSE, retStatus);
+                }
+            } else if (!IS_VALID_SIGNALING_CLIENT_HANDLE(pSampleConfiguration->signalingClientHandle)) {
+                // Same dead-end reached some other way (fetch failed and the handle is gone):
+                // exit rather than wedge alive with no signaling client.
+                DLOGE("[KVS Common] signaling client handle invalid after fetch failure 0x%08x; exiting so the supervisor can restart us", retStatus);
+                CHK(FALSE, retStatus);
             }
         }
 
