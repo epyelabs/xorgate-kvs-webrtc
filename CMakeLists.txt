@@ -65,17 +65,3 @@ target_link_libraries(xorgate-kvs-webrtc ${XORGATE_KVS_LIBS})
 
 # Let the binary find the SDK shared libs at runtime without LD_LIBRARY_PATH.
 set_target_properties(xorgate-kvs-webrtc PROPERTIES BUILD_RPATH "${XORGATE_KVS_RPATH}")
-
-# --- Cloud viewer-recorder: joins a channel as VIEWER, records H.264 -> MP4 ---
-# Built into the Fargate recorder image (see Dockerfile). Shares the SDK sample glue
-# (Common.c) but uses recorder.c as entry + GstRecorder.c for the record pipeline.
-add_executable(xorgate-kvs-recorder
-  src/recorder.c
-  src/Common.c
-  src/GstRecorder.c)
-
-target_compile_definitions(xorgate-kvs-recorder PRIVATE ENABLE_DATA_CHANNEL)
-target_include_directories(xorgate-kvs-recorder PRIVATE ${XORGATE_KVS_INCLUDE_DIRS})
-target_link_directories(xorgate-kvs-recorder PRIVATE ${XORGATE_KVS_LINK_DIRS})
-target_link_libraries(xorgate-kvs-recorder ${XORGATE_KVS_LIBS})
-set_target_properties(xorgate-kvs-recorder PROPERTIES BUILD_RPATH "${XORGATE_KVS_RPATH}")
