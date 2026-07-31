@@ -101,6 +101,23 @@ extern "C" {
 
 #define KVS_GST_PIPELINE_ENV_VAR ((PCHAR) "KVS_GST_PIPELINE")
 
+/* Live-stream idle teardown (optimize-system-process-cycle plan, Phase 9).
+ *
+ * The encoder pipeline starts on the FIRST viewer offer and, in the stock sample, then runs
+ * forever: the sender thread blocks on the GStreamer bus, so every frame keeps being encoded
+ * and thrown away once the last viewer leaves. One x264 encoder per camera burning a core on
+ * a power-starved device is the most expensive thing we do for nobody.
+ *
+ * KVS_IDLE_TEARDOWN_SECS = seconds with ZERO streaming sessions after which the pipeline is
+ * stopped (it restarts transparently on the next offer). 0 disables the feature and restores
+ * the stock behavior exactly. The grace period exists because a browser refresh is a
+ * disconnect immediately followed by a reconnect — tearing down instantly would thrash the
+ * encoder and cost the returning viewer a cold start for nothing.
+ */
+#define IDLE_TEARDOWN_SECS_ENV_VAR ((PCHAR) "KVS_IDLE_TEARDOWN_SECS")
+#define DEFAULT_IDLE_TEARDOWN_SECS 30
+#define MAX_IDLE_TEARDOWN_SECS     3600
+
 #define MAX_DATA_CHANNEL_METRICS_MESSAGE_SIZE     260 // strlen(DATA_CHANNEL_MESSAGE_TEMPLATE) + 20 * 5
 #define MAX_PEER_CONNECTION_METRICS_MESSAGE_SIZE  105 // strlen(PEER_CONNECTION_METRICS_JSON_TEMPLATE) + 20 * 2
 #define MAX_SIGNALING_CLIENT_METRICS_MESSAGE_SIZE 736 // strlen(SIGNALING_CLIENT_METRICS_JSON_TEMPLATE) + 20 * 10
@@ -150,6 +167,17 @@ struct __SampleConfiguration {
     volatile ATOMIC_BOOL mediaThreadStarted;
     volatile ATOMIC_BOOL recreateSignalingClient;
     volatile ATOMIC_BOOL connected;
+    /* Idle teardown: set by the session-cleanup watchdog, read by the appsink callback, which
+     * answers GST_FLOW_EOS — the same mechanism appTerminateFlag uses, so the blocked bus wait
+     * in sendGstreamerAudioVideo() returns through the existing GST_STATE_NULL teardown and no
+     * GStreamer call is ever made from another thread. Cleared when the pipeline is (re)started. */
+    volatile ATOMIC_BOOL mediaStopRequested;
+    /* KVS_IDLE_TEARDOWN_SECS in ms; 0 = feature off. Read once at startup. */
+    UINT64 idleTeardownMs;
+    /* Monotonic ms at which the session count last hit zero, 0 when not idle. NEVER wall clock:
+     * this device has no RTC battery and NTP steps it minutes into every boot. Guarded by
+     * sampleConfigurationObjLock (only the session-cleanup loop touches it). */
+    UINT64 mediaIdleSinceMs;
     SampleSourceType srcType;
     ChannelInfo channelInfo;
     PCHAR pCaCertPath;
