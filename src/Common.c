@@ -1,7 +1,25 @@
 #define LOG_CLASS "WebRtcSamples"
 #include "Samples.h"
+#include <time.h>
 
 PSampleConfiguration gSampleConfiguration = NULL;
+
+/**
+ * Milliseconds on a clock that only ever moves forward. Used for the idle-teardown timer.
+ *
+ * The device this runs on has no RTC battery: it boots from fake-hwclock and NTP steps the wall
+ * clock — sometimes by minutes, historically by decades — once LTE comes up. Any interval
+ * measured from two wall-clock reads is therefore a lie. (This project has burned two phantom
+ * bug reports on exactly that mistake.)
+ */
+static UINT64 monotonicMs()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return ((UINT64) ts.tv_sec) * 1000 + ((UINT64) ts.tv_nsec) / 1000000;
+}
 
 VOID sigintHandler(INT32 sigNum)
 {
@@ -166,12 +184,17 @@ PVOID mediaSenderRoutine(PVOID customData)
     pSampleConfiguration->audioSenderTid = INVALID_TID_VALUE;
 
     MUTEX_LOCK(pSampleConfiguration->sampleConfigurationObjLock);
-    while (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->connected) && !ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
+    // mediaStopRequested is checked here too: a session whose peer connection never reaches
+    // CONNECTED would otherwise leave this thread parked here forever, and the idle watchdog's
+    // request (which only the appsink can act on, and no samples flow yet) would never land.
+    while (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->connected) && !ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag) &&
+           !ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested)) {
         CVAR_WAIT(pSampleConfiguration->cvar, pSampleConfiguration->sampleConfigurationObjLock, 5 * HUNDREDS_OF_NANOS_IN_A_SECOND);
     }
     MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
 
     CHK(!ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag), retStatus);
+    CHK(!ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested), retStatus);
 
     DLOGD("pSampleConfiguration->MediaType:", pSampleConfiguration->mediaType);
 
@@ -197,10 +220,56 @@ PVOID mediaSenderRoutine(PVOID customData)
     }
 
 CleanUp:
-    // clean the flag of the media thread.
-    ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaThreadStarted, FALSE);
+    // clean the flag of the media thread, then wake the session-cleanup loop so it can re-arm
+    // immediately if a viewer arrived while we were tearing down. Taking the lock around the two
+    // makes the wake-up race-free: the loop cannot observe the cleared flag and then miss the
+    // broadcast. It also cannot deadlock against the loop's THREAD_JOIN of this thread — that
+    // join only runs once the flag reads FALSE, i.e. after this unlock.
+    if (pSampleConfiguration != NULL && IS_VALID_MUTEX_VALUE(pSampleConfiguration->sampleConfigurationObjLock)) {
+        MUTEX_LOCK(pSampleConfiguration->sampleConfigurationObjLock);
+        ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaThreadStarted, FALSE);
+        CVAR_BROADCAST(pSampleConfiguration->cvar);
+        MUTEX_UNLOCK(pSampleConfiguration->sampleConfigurationObjLock);
+    } else if (pSampleConfiguration != NULL) {
+        ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaThreadStarted, FALSE);
+    }
     CHK_LOG_ERR(retStatus);
     return NULL;
+}
+
+/**
+ * Start the media sender thread unless one is already running. Idempotent, and the ONLY place
+ * that creates it, so the previous (already-exited) thread can be joined here rather than leaked:
+ * with idle teardown enabled the thread is created once per viewing session, not once per process
+ * life, and an unjoined pthread keeps its stack forever.
+ *
+ * The caller must hold sampleConfigurationObjLock. The join is safe under it: mediaThreadStarted
+ * reads FALSE only after the exiting thread has released that same lock (see mediaSenderRoutine's
+ * CleanUp), so the join returns immediately.
+ */
+static VOID startMediaSenderThreadIfNeeded(PSampleConfiguration pSampleConfiguration)
+{
+    if (pSampleConfiguration == NULL || ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
+        return;
+    }
+    if (ATOMIC_EXCHANGE_BOOL(&pSampleConfiguration->mediaThreadStarted, TRUE)) {
+        return; // already running (or still tearing down — the cleanup loop re-arms it)
+    }
+
+    if (pSampleConfiguration->mediaSenderTid != INVALID_TID_VALUE) {
+        THREAD_JOIN(pSampleConfiguration->mediaSenderTid, NULL);
+        pSampleConfiguration->mediaSenderTid = INVALID_TID_VALUE;
+    }
+
+    // Clear any stale teardown request before the new pipeline produces its first sample,
+    // otherwise it would EOS itself the moment it starts.
+    ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaStopRequested, FALSE);
+    if (STATUS_FAILED(THREAD_CREATE(&pSampleConfiguration->mediaSenderTid, mediaSenderRoutine, (PVOID) pSampleConfiguration))) {
+        // Leaving the flag set would wedge the channel dark for the process lifetime.
+        DLOGE("[KVS GStreamer Master] Failed to create the media sender thread; will retry on the next tick");
+        pSampleConfiguration->mediaSenderTid = INVALID_TID_VALUE;
+        ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaThreadStarted, FALSE);
+    }
 }
 
 STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSession pSampleStreamingSession, PSignalingMessage pSignalingMessage)
@@ -208,7 +277,6 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
     STATUS retStatus = STATUS_SUCCESS;
     RtcSessionDescriptionInit offerSessionDescriptionInit;
     NullableBool canTrickle;
-    BOOL mediaThreadStarted;
 
     CHK(pSampleConfiguration != NULL && pSignalingMessage != NULL, STATUS_NULL_ARG);
 
@@ -231,10 +299,10 @@ STATUS handleOffer(PSampleConfiguration pSampleConfiguration, PSampleStreamingSe
         CHK_STATUS(respondWithAnswer(pSampleStreamingSession));
     }
 
-    mediaThreadStarted = ATOMIC_EXCHANGE_BOOL(&pSampleConfiguration->mediaThreadStarted, TRUE);
-    if (!mediaThreadStarted) {
-        THREAD_CREATE(&pSampleConfiguration->mediaSenderTid, mediaSenderRoutine, (PVOID) pSampleConfiguration);
-    }
+    // Lazy start: the encoder pipeline only exists while somebody is watching. If a teardown is
+    // still draining, this is a no-op and the session-cleanup loop re-arms as soon as the old
+    // thread is gone (it broadcasts the cvar on its way out, so that is immediate).
+    startMediaSenderThreadIfNeeded(pSampleConfiguration);
 
     // The audio video receive routine should be per streaming session
     if (pSampleConfiguration->receiveAudioVideoSource != NULL) {
@@ -1000,6 +1068,29 @@ STATUS createSampleConfiguration(PCHAR channelName, SIGNALING_CHANNEL_ROLE_TYPE 
     ATOMIC_STORE_BOOL(&pSampleConfiguration->appTerminateFlag, FALSE);
     ATOMIC_STORE_BOOL(&pSampleConfiguration->recreateSignalingClient, FALSE);
     ATOMIC_STORE_BOOL(&pSampleConfiguration->connected, FALSE);
+    ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaStopRequested, FALSE);
+
+    // Idle teardown window (see IDLE_TEARDOWN_SECS_ENV_VAR in Samples.h). An unparseable or
+    // out-of-range value falls back to the default rather than disabling the feature silently.
+    UINT64 idleTeardownSecs = DEFAULT_IDLE_TEARDOWN_SECS;
+    PCHAR pIdleTeardownSecs = GETENV(IDLE_TEARDOWN_SECS_ENV_VAR);
+    if (pIdleTeardownSecs != NULL) {
+        UINT64 parsed;
+        if (STRTOUI64(pIdleTeardownSecs, NULL, 10, &parsed) == STATUS_SUCCESS && parsed <= MAX_IDLE_TEARDOWN_SECS) {
+            idleTeardownSecs = parsed;
+        } else {
+            DLOGW("Ignoring %s='%s' (expected 0-%u seconds); using %u", IDLE_TEARDOWN_SECS_ENV_VAR, pIdleTeardownSecs, MAX_IDLE_TEARDOWN_SECS,
+                  DEFAULT_IDLE_TEARDOWN_SECS);
+        }
+    }
+    pSampleConfiguration->idleTeardownMs = idleTeardownSecs * 1000;
+    pSampleConfiguration->mediaIdleSinceMs = 0;
+    if (idleTeardownSecs == 0) {
+        DLOGI("Idle encoder teardown disabled (%s=0); the media pipeline runs from the first viewer until exit",
+              IDLE_TEARDOWN_SECS_ENV_VAR);
+    } else {
+        DLOGI("Idle encoder teardown after %" PRIu64 "s with no viewers", idleTeardownSecs);
+    }
 
     CHK_STATUS(timerQueueCreate(&pSampleConfiguration->timerQueueHandle));
 
@@ -1510,6 +1601,47 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
 
         // Check if any lingering pending message queues
         CHK_STATUS(removeExpiredMessageQueues(pSampleConfiguration->pPendingSignalingMessageForRemoteClient));
+
+        // Idle encoder teardown (Phase 9). Everything below is inert when the feature is off, so
+        // KVS_IDLE_TEARDOWN_SECS=0 is byte-for-byte the stock lifecycle.
+        if (pSampleConfiguration->idleTeardownMs > 0) {
+            BOOL mediaUp = ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaThreadStarted);
+            UINT32 viewers = pSampleConfiguration->streamingSessionCount;
+            UINT64 nowMs = monotonicMs();
+
+            if (!mediaUp) {
+                if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested)) {
+                    DLOGI("[KVS idle teardown] encoder pipeline stopped; process is back to bridge-idle");
+                    ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaStopRequested, FALSE);
+                }
+                pSampleConfiguration->mediaIdleSinceMs = 0;
+                if (viewers > 0) {
+                    // Either a viewer arrived while the teardown was draining (refresh storm), or
+                    // the pipeline died on its own. Both want the same thing: bring it back.
+                    DLOGI("[KVS idle teardown] %u viewer session(s) with no encoder; restarting the media pipeline", viewers);
+                    startMediaSenderThreadIfNeeded(pSampleConfiguration);
+                }
+            } else if (viewers > 0) {
+                if (pSampleConfiguration->mediaIdleSinceMs != 0) {
+                    DLOGI("[KVS idle teardown] viewer returned after %" PRIu64 "ms idle; teardown cancelled",
+                          nowMs - pSampleConfiguration->mediaIdleSinceMs);
+                    pSampleConfiguration->mediaIdleSinceMs = 0;
+                }
+            } else if (pSampleConfiguration->mediaIdleSinceMs == 0) {
+                pSampleConfiguration->mediaIdleSinceMs = nowMs;
+                DLOGI("[KVS idle teardown] last viewer gone; stopping the encoder in %" PRIu64 "s unless one returns",
+                      pSampleConfiguration->idleTeardownMs / 1000);
+            } else if (!ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested) &&
+                       nowMs - pSampleConfiguration->mediaIdleSinceMs >= pSampleConfiguration->idleTeardownMs) {
+                DLOGI("[KVS idle teardown] no viewers for %" PRIu64 "ms; requesting encoder teardown",
+                      nowMs - pSampleConfiguration->mediaIdleSinceMs);
+                // The appsink callback converts this into EOS on the next frame, which unblocks the
+                // sender thread's bus wait and runs the existing GST_STATE_NULL teardown. If the
+                // source has stalled there are no frames to carry it — harmless, since a stalled
+                // pipeline is not burning CPU either, but say so rather than looking hung.
+                ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaStopRequested, TRUE);
+            }
+        }
 
         // periodically wake up and clean up terminated streaming session
         CVAR_WAIT(pSampleConfiguration->cvar, pSampleConfiguration->sampleConfigurationObjLock, SAMPLE_SESSION_CLEANUP_WAIT_PERIOD);

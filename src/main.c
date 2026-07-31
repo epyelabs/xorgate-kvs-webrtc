@@ -11,6 +11,12 @@ INT32 main(INT32 argc, CHAR* argv[])
     RTC_CODEC audioCodec = RTC_CODEC_OPUS;
     RTC_CODEC videoCodec = RTC_CODEC_H264_PROFILE_42E01F_LEVEL_ASYMMETRY_ALLOWED_PACKETIZATION_MODE;
 
+    // The SDK logs with printf, and our stdout is a pipe to the device agent (which forwards it to
+    // the journal), so libc block-buffers it: measured 3-7 MINUTES of lag before a 4 KB block
+    // flushed, and everything still in the buffer is lost when the supervisor SIGINTs us. That makes
+    // the runtime's own diagnostics useless exactly when something is going wrong. Line-buffer it.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     SET_INSTRUMENTED_ALLOCATORS();
     UINT32 logLevel = setLogLevel();
 

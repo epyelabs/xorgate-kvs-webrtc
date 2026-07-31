@@ -134,7 +134,11 @@ CleanUp:
         gst_sample_unref(sample);
     }
 
-    if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag)) {
+    // GST_FLOW_EOS makes the source push EOS downstream, which lands on the bus and releases the
+    // blocked wait in sendGstreamerAudioVideo() — the one existing exit from this pipeline.
+    // Two things ask for it: process shutdown, and the idle watchdog once the last viewer has been
+    // gone for KVS_IDLE_TEARDOWN_SECS (see Samples.h).
+    if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag) || ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested)) {
         ret = GST_FLOW_EOS;
     }
 
