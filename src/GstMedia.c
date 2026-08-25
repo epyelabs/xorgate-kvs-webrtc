@@ -3,10 +3,18 @@
 // Fallback pipeline used when KVS_GST_PIPELINE is unset or its file cannot be read.
 // Edit this per device. Any software encoder must keep name=sampleVideoEncoder for TWCC bitrate
 // adaptation, and the pipeline must end in appsink ... name=appsink-video.
+//
+// DELIBERATELY CHEAP AND BOUNDED (cm4-support plan, #5): this only ever runs when a channel
+// has lost its pipeline file — a broken state — and it used to be `autovideosrc ... 720p25`
+// with auto-threaded x264enc. Bench-measured on a CM4, that fallback burned 302% CPU (3 cores):
+// the auto-picked source is not live, so nothing paces production and the encoder runs flat
+// out. SMPTE bars at a live-paced 720p15 with a single-threaded ultrafast encode make the same
+// broken state visually obvious in a viewer at a few percent of one core, and a test source
+// can never open a real camera and fight the agent's capture daemon for it.
 #define DEFAULT_GST_PIPELINE                                                                                                                          \
-    "autovideosrc ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=25/1 ! "                                                      \
-    "x264enc name=sampleVideoEncoder bframes=0 speed-preset=veryfast bitrate=512 byte-stream=TRUE "                                                  \
-    "tune=zerolatency ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! "                                                     \
+    "videotestsrc is-live=TRUE ! queue ! videoconvert ! video/x-raw,width=1280,height=720,framerate=15/1 ! "                                          \
+    "x264enc name=sampleVideoEncoder bframes=0 speed-preset=ultrafast threads=1 bitrate=512 byte-stream=TRUE "                                        \
+    "tune=zerolatency ! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline ! "                                                      \
     "appsink sync=TRUE emit-signals=TRUE name=appsink-video"
 
 GstElement* senderPipeline = NULL;
