@@ -172,6 +172,9 @@ PVOID sendGstreamerAudioVideo(PVOID args)
     GError* gError = NULL;
     gchar* gDebug = NULL;
     GstStateChangeReturn stateChangeStatus = GST_STATE_CHANGE_SUCCESS;
+    BOOL forcedTeardown = FALSE;   // EOS never arrived after a stop request; we tore down by hand
+    UINT64 stopSeenAtMs = 0;       // monotonic ms at which this thread first saw the stop request
+    UINT64 teardownStartMs = 0;
     PSampleConfiguration pSampleConfiguration = (PSampleConfiguration) args;
     PCHAR pPipelineFromFile = NULL; // heap buffer holding pipeline file contents (freed in CleanUp)
     PCHAR pPipelineStr = DEFAULT_GST_PIPELINE;
@@ -376,9 +379,28 @@ PVOID sendGstreamerAudioVideo(PVOID args)
     DLOGD("[KVS GStreamer Master] State change null->playing returned status: %d", stateChangeStatus);
     CHK_ERR(stateChangeStatus != GST_STATE_CHANGE_FAILURE, STATUS_FORMAT_ERROR, "State change to PLAYING failed!");
 
-    /* block until error or EOS */
+    /* Block until error or EOS. The wait is polled so that, once a stop has been requested
+     * (idle teardown or process shutdown), it is bounded: a pipeline whose EOS never reaches
+     * the bus (the CM4's v4l2h264enc drain — see GST_TEARDOWN_DRAIN_TIMEOUT_MS in Samples.h)
+     * is flushed and driven to NULL below instead of pinning this thread forever. */
     bus = gst_element_get_bus(senderPipeline);
-    msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    while (msg == NULL) {
+        msg = gst_bus_timed_pop_filtered(bus, (GstClockTime) GST_TEARDOWN_BUS_POLL_MS * GST_MSECOND, GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+        if (msg != NULL) {
+            break;
+        }
+        if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->appTerminateFlag) || ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested)) {
+            UINT64 nowMs = sampleMonotonicMs();
+            if (stopSeenAtMs == 0) {
+                stopSeenAtMs = nowMs;
+            } else if (nowMs - stopSeenAtMs >= GST_TEARDOWN_DRAIN_TIMEOUT_MS) {
+                DLOGW("[KVS GStreamer Master] No EOS %" PRIu64 "ms after the stop request; forcing the pipeline down (flush + NULL)",
+                      nowMs - stopSeenAtMs);
+                forcedTeardown = TRUE;
+                break;
+            }
+        }
+    }
 
 CleanUp:
     if (gError != NULL) {
@@ -413,9 +435,21 @@ CleanUp:
         bus = NULL;
     }
     if (senderPipeline != NULL) {
+        if (forcedTeardown) {
+            // FLUSH_START from the bin reaches every element through the sources: it aborts the
+            // encoder's drain wait and unblocks shmsrc so the NULL transition below can run.
+            teardownStartMs = sampleMonotonicMs();
+            if (!gst_element_send_event(senderPipeline, gst_event_new_flush_start())) {
+                DLOGW("[KVS GStreamer Master] Pipeline did not accept FLUSH_START; trying the NULL transition anyway");
+            }
+        }
         stateChangeStatus = gst_element_set_state(senderPipeline, GST_STATE_NULL);
         if (stateChangeStatus == GST_STATE_CHANGE_FAILURE) {
             DLOGE("[KVS GStreamer Master] State change to NULL failed!");
+        }
+        if (forcedTeardown) {
+            DLOGW("[KVS GStreamer Master] Forced teardown completed in %" PRIu64 "ms (state change status %d)",
+                  sampleMonotonicMs() - teardownStartMs, stateChangeStatus);
         }
         gst_object_unref(senderPipeline);
         senderPipeline = NULL;

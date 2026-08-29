@@ -118,6 +118,30 @@ extern "C" {
 #define DEFAULT_IDLE_TEARDOWN_SECS 30
 #define MAX_IDLE_TEARDOWN_SECS     3600
 
+/* Bounded teardown (cm4 wedge fix).
+ *
+ * The teardown above (and process shutdown) asks the appsink to answer GST_FLOW_EOS and then
+ * relies on that EOS reaching the bus. With the software x264 pipeline it does, in ~20 ms. With
+ * the CM4's hardware pipeline (shmsrc ! v4l2h264enc ! appsink) it never does: the v4l2 encoder's
+ * EOS drain wedges, the sender thread waits on the bus forever with mediaThreadStarted still
+ * TRUE, every later viewer gets a peer connection with zero frames, and the stalled shmsrc pins
+ * the capture bridge's shm buffers so even libcamera stops. Only a process restart recovered it.
+ *
+ * So the bus wait is polled, and once a stop has been requested it is bounded: after
+ * GST_TEARDOWN_DRAIN_TIMEOUT_MS without ERROR/EOS the sender thread flushes the pipeline and
+ * drives it to NULL itself. A pipeline whose EOS arrives in time (x264) never notices — the
+ * only change for it is a periodic wake-up of the wait, not a different exit path.
+ *
+ * Last resort, in the session-cleanup loop: if the thread has not come back
+ * GST_TEARDOWN_FORCE_EXIT_MS after the request (the forced NULL hung too), exit the process.
+ * The device agent supervises this master and respawns it; the process death also releases the
+ * shm socket, which un-wedges the capture bridge. That is strictly better than the previous
+ * behavior (dark channel until reboot) and is unreachable when the drain works. */
+#define GST_TEARDOWN_BUS_POLL_MS      250
+#define GST_TEARDOWN_DRAIN_TIMEOUT_MS 3000
+#define GST_TEARDOWN_FORCE_EXIT_MS    15000
+#define GST_TEARDOWN_FORCE_EXIT_CODE  3
+
 #define MAX_DATA_CHANNEL_METRICS_MESSAGE_SIZE     260 // strlen(DATA_CHANNEL_MESSAGE_TEMPLATE) + 20 * 5
 #define MAX_PEER_CONNECTION_METRICS_MESSAGE_SIZE  105 // strlen(PEER_CONNECTION_METRICS_JSON_TEMPLATE) + 20 * 2
 #define MAX_SIGNALING_CLIENT_METRICS_MESSAGE_SIZE 736 // strlen(SIGNALING_CLIENT_METRICS_JSON_TEMPLATE) + 20 * 10
@@ -172,6 +196,10 @@ struct __SampleConfiguration {
      * in sendGstreamerAudioVideo() returns through the existing GST_STATE_NULL teardown and no
      * GStreamer call is ever made from another thread. Cleared when the pipeline is (re)started. */
     volatile ATOMIC_BOOL mediaStopRequested;
+    /* Monotonic ms at which mediaStopRequested was last raised, 0 when no request is pending.
+     * Guarded by sampleConfigurationObjLock (only the session-cleanup loop touches it); it
+     * arms the GST_TEARDOWN_FORCE_EXIT_MS last resort. */
+    UINT64 mediaStopRequestedAtMs;
     /* KVS_IDLE_TEARDOWN_SECS in ms; 0 = feature off. Read once at startup. */
     UINT64 idleTeardownMs;
     /* Monotonic ms at which the session count last hit zero, 0 when not idle. NEVER wall clock:
@@ -303,6 +331,8 @@ PVOID receiveGstreamerAudioVideo(PVOID);
 PVOID sendVideoPackets(PVOID);
 PVOID sendAudioPackets(PVOID);
 PVOID sendGstreamerAudioVideo(PVOID);
+/* Milliseconds on CLOCK_MONOTONIC (never wall clock — see Common.c). */
+UINT64 sampleMonotonicMs(VOID);
 PVOID sampleReceiveAudioVideoFrame(PVOID);
 PVOID getPeriodicIceCandidatePairStats(PVOID);
 STATUS getIceCandidatePairStatsCallback(UINT32, UINT64, UINT64);
