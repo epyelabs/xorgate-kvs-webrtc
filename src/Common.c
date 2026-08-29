@@ -1,6 +1,7 @@
 #define LOG_CLASS "WebRtcSamples"
 #include "Samples.h"
 #include <time.h>
+#include <unistd.h>
 
 PSampleConfiguration gSampleConfiguration = NULL;
 
@@ -19,6 +20,11 @@ static UINT64 monotonicMs()
         return 0;
     }
     return ((UINT64) ts.tv_sec) * 1000 + ((UINT64) ts.tv_nsec) / 1000000;
+}
+
+UINT64 sampleMonotonicMs(VOID)
+{
+    return monotonicMs();
 }
 
 VOID sigintHandler(INT32 sigNum)
@@ -1614,6 +1620,7 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
                     DLOGI("[KVS idle teardown] encoder pipeline stopped; process is back to bridge-idle");
                     ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaStopRequested, FALSE);
                 }
+                pSampleConfiguration->mediaStopRequestedAtMs = 0;
                 pSampleConfiguration->mediaIdleSinceMs = 0;
                 if (viewers > 0) {
                     // Either a viewer arrived while the teardown was draining (refresh storm), or
@@ -1621,6 +1628,17 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
                     DLOGI("[KVS idle teardown] %u viewer session(s) with no encoder; restarting the media pipeline", viewers);
                     startMediaSenderThreadIfNeeded(pSampleConfiguration);
                 }
+            } else if (ATOMIC_LOAD_BOOL(&pSampleConfiguration->mediaStopRequested) && pSampleConfiguration->mediaStopRequestedAtMs != 0 &&
+                       nowMs - pSampleConfiguration->mediaStopRequestedAtMs >= GST_TEARDOWN_FORCE_EXIT_MS) {
+                // The sender thread was asked to stop GST_TEARDOWN_FORCE_EXIT_MS ago and is still
+                // alive, so even its forced flush + NULL hung inside GStreamer. Nothing in this
+                // process can recover a pipeline thread stuck in a driver wait; a joined shutdown
+                // would hang on that same thread. Die instead: the agent respawns the master and
+                // the closed shm socket frees the capture bridge. (Unreachable when EOS drains.)
+                DLOGE("[KVS idle teardown] encoder pipeline did not stop %" PRIu64 "ms after the teardown request (%u viewer(s) waiting); "
+                      "exiting so the supervisor can restart us",
+                      nowMs - pSampleConfiguration->mediaStopRequestedAtMs, viewers);
+                _exit(GST_TEARDOWN_FORCE_EXIT_CODE);
             } else if (viewers > 0) {
                 if (pSampleConfiguration->mediaIdleSinceMs != 0) {
                     DLOGI("[KVS idle teardown] viewer returned after %" PRIu64 "ms idle; teardown cancelled",
@@ -1640,6 +1658,7 @@ STATUS sessionCleanupWait(PSampleConfiguration pSampleConfiguration)
                 // source has stalled there are no frames to carry it — harmless, since a stalled
                 // pipeline is not burning CPU either, but say so rather than looking hung.
                 ATOMIC_STORE_BOOL(&pSampleConfiguration->mediaStopRequested, TRUE);
+                pSampleConfiguration->mediaStopRequestedAtMs = nowMs;
             }
         }
 
